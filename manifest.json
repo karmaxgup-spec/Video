@@ -1,0 +1,11 @@
+{
+    "display_name": "Video Frame Caption",
+    "loading_order": 20,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "you",
+    "version": "1.0.0",
+    "homePage": ""
+}
