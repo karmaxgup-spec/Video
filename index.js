@@ -9,6 +9,7 @@ const DEFAULTS = {
     // {start} {middle} {end} are replaced with the captions
     template: '\n\n[Video frames — start: {start} | middle: {middle} | end: {end}]',
     maxWidth: 1024,
+    autoReply: true, // trigger a reply after captioning via the Generate Caption button
 };
 
 const VIDEO_RE = /\.(mp4|webm|mov|mkv|m4v|ogv)(\?|#|$)/i;
@@ -153,6 +154,77 @@ async function onMessageSent(mesId) {
     }
 }
 
+/** Let the built-in caption file pickers accept video files too. */
+function allowVideoInPickers() {
+    document.querySelectorAll('input[type="file"]').forEach(el => {
+        if (/caption|img_file/i.test(el.id) && el.accept && !el.accept.includes('video')) {
+            el.accept += ',video/*';
+        }
+    });
+}
+
+/**
+ * The built-in "Generate Caption" flow only understands images. Intercept its
+ * file input (capture phase, before ST's own handler) when the file is a video.
+ */
+async function onCaptionFileChosen(e) {
+    const input = e.target;
+    if (!(input instanceof HTMLInputElement) || input.type !== 'file') return;
+    const file = input.files?.[0];
+    if (!file || !file.type.startsWith('video/')) return;
+    if (!/caption|img_file/i.test(input.id)) {
+        console.debug(`[${MODULE}] video chosen on unrecognized input id="${input.id}"`);
+        return;
+    }
+
+    e.stopImmediatePropagation();
+    e.preventDefault();
+    input.value = '';
+
+    const { s } = getSettings();
+    const { chat, name1, addOneMessage, updateMessageBlock, saveChat, executeSlashCommandsWithOptions } = ctx();
+    const blobUrl = URL.createObjectURL(file);
+
+    try {
+        toastr.info('Captioning video frames…', 'Video Frame Caption');
+        const frames = await extractFrames(blobUrl, s.maxWidth);
+
+        // Create the user message first; /caption needs a message to work on.
+        const message = {
+            name: name1,
+            is_user: true,
+            is_system: false,
+            send_date: new Date().toISOString(),
+            mes: '',
+            extra: {},
+        };
+        chat.push(message);
+        const mesId = chat.length - 1;
+        addOneMessage(message);
+
+        const captions = [];
+        for (const f of frames) captions.push((await captionFrame(mesId, f)) || '(no caption)');
+        const [start, middle, end] = captions;
+
+        message.extra.video_captions = { start, middle, end };
+        message.mes = s.template
+            .replace('{start}', start)
+            .replace('{middle}', middle)
+            .replace('{end}', end)
+            .trim();
+        updateMessageBlock(mesId, message);
+        await saveChat();
+        toastr.success('Video captioned', 'Video Frame Caption');
+
+        if (s.autoReply) await executeSlashCommandsWithOptions('/trigger');
+    } catch (err) {
+        console.error(`[${MODULE}]`, err);
+        toastr.error(err.message, 'Video Frame Caption');
+    } finally {
+        URL.revokeObjectURL(blobUrl);
+    }
+}
+
 function addSettingsUi() {
     const { s, save } = getSettings();
     const html = `
@@ -166,6 +238,10 @@ function addSettingsUi() {
                 <input id="vfc_enabled" type="checkbox" ${s.enabled ? 'checked' : ''} />
                 <span>Auto-caption start / middle / end frame of sent videos</span>
             </label>
+            <label class="checkbox_label">
+                <input id="vfc_autoreply" type="checkbox" ${s.autoReply ? 'checked' : ''} />
+                <span>Get a reply right after captioning (Generate Caption button)</span>
+            </label>
             <label for="vfc_template">Message template ({start} {middle} {end})</label>
             <textarea id="vfc_template" class="text_pole textarea_compact" rows="3"></textarea>
         </div>
@@ -173,10 +249,17 @@ function addSettingsUi() {
     $('#extensions_settings2').append(html);
     $('#vfc_template').val(s.template).on('input', function () { s.template = String($(this).val()); save(); });
     $('#vfc_enabled').on('change', function () { s.enabled = $(this).prop('checked'); save(); });
+    $('#vfc_autoreply').on('change', function () { s.autoReply = $(this).prop('checked'); save(); });
 }
 
 jQuery(() => {
     const { eventSource, event_types } = ctx();
     addSettingsUi();
     eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+
+    // Capture phase on document so we run before ST's own caption handler.
+    document.addEventListener('change', onCaptionFileChosen, true);
+    allowVideoInPickers();
+    // Pickers may be created lazily; re-check when the extensions menu is opened.
+    document.addEventListener('click', allowVideoInPickers, true);
 });
