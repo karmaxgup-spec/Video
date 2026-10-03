@@ -123,6 +123,54 @@ async function captionFrame(mesId, dataUrl) {
     }
 }
 
+const VIDEO_EXTS = ['mp4', 'webm', 'mov', 'avi', 'wmv', 'flv', 'mkv', 'm4v', 'ogv'];
+
+function fileToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(String(r.result).split(',')[1]);
+        r.onerror = () => reject(new Error('Could not read video file'));
+        r.readAsDataURL(blob);
+    });
+}
+
+/** Save the video on the ST server (same endpoint ST uses for attachments). Returns its URL. */
+async function uploadVideo(file) {
+    const { getRequestHeaders, name2 } = ctx();
+    let ext = (file.name?.split('.').pop() || '').toLowerCase();
+    if (!VIDEO_EXTS.includes(ext)) ext = (file.type.split('/')[1] || 'mp4').toLowerCase();
+    if (!VIDEO_EXTS.includes(ext)) ext = 'mp4';
+
+    const res = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({
+            image: await fileToBase64(file),
+            format: ext,
+            ch_name: name2,
+            filename: `${Date.now()}_video`,
+        }),
+    });
+    if (!res.ok) throw new Error('Failed to upload the video to the server');
+    return (await res.json()).path;
+}
+
+/** Same attachment shape the built-in captioner uses: tap the media to see the caption. */
+function attachCaptionedVideo(message, url, captionText) {
+    const showInChat = !!ctx().extensionSettings?.caption?.show_in_chat;
+    message.extra = message.extra || {};
+    message.extra.media = [{
+        url,
+        type: 'video',
+        title: captionText,
+        captioned: true,
+        source: 'captioned',
+    }];
+    message.extra.media_display = 'gallery';
+    message.extra.media_index = 0;
+    message.extra.inline_image = showInChat;
+}
+
 /** Caption all frames; throw if any frame fails so we never send an empty message. */
 async function captionAllFrames(mesId, frames) {
     const labels = ['start', 'middle', 'end'];
@@ -161,6 +209,11 @@ async function onMessageSent(mesId) {
             .replace('{middle}', middle)
             .replace('{end}', end);
 
+        const att = Array.isArray(message.extra.media) ? message.extra.media.find(m => m?.type === 'video') : null;
+        if (att) {
+            att.title = [start, middle, end].map((c, i) => `${['Start', 'Middle', 'End'][i]}: ${c}`).join('\n');
+            att.captioned = true;
+        }
         updateMessageBlock(mesId, message);
         await saveChat();
         toastr.success('Video captioned', 'Video Frame Caption');
@@ -228,6 +281,7 @@ async function onCaptionFileChosen(e) {
             .replace('{middle}', middle)
             .replace('{end}', end)
             .trim();
+        attachCaptionedVideo(message, await uploadVideo(file), message.mes);
         updateMessageBlock(mesId, message);
         await saveChat();
         toastr.success('Video captioned', 'Video Frame Caption');
