@@ -94,27 +94,46 @@ async function extractFrames(url, maxWidth) {
 
 /**
  * Caption one frame using the user's configured captioning workflow.
- * Trick: temporarily put the frame on the message as its image, then run the
- * built-in /caption command against that message.
+ * Newer ST stores attachments in message.extra.media, and /caption mesId=N
+ * reads from there. So: temporarily give the message the frame as its media,
+ * run the built-in /caption command, then restore the original media.
  */
 async function captionFrame(mesId, dataUrl) {
     const { chat, executeSlashCommandsWithOptions } = ctx();
     const message = chat[mesId];
     message.extra = message.extra || {};
-    const prev = { image: message.extra.image, inline: message.extra.inline_image };
+    const prevMedia = message.extra.media;
 
-    message.extra.image = dataUrl;
-    message.extra.inline_image = false;
+    const blob = await (await fetch(dataUrl)).blob();
+    const blobUrl = URL.createObjectURL(blob);
+    message.extra.media = [{ url: blobUrl, type: 'image' }];
+
     try {
-        const res = await executeSlashCommandsWithOptions(`/caption quiet=true mesId=${mesId}`, {
+        const run = executeSlashCommandsWithOptions(`/caption quiet=true mesId=${mesId}`, {
             handleParserErrors: true,
             handleExecutionErrors: true,
         });
-        return (res?.pipe || '').trim();
+        // Guard: never hang forever if the caption source stalls.
+        const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('Caption request timed out')), 120000));
+        const res = await Promise.race([run, timeout]);
+        return String(res?.pipe ?? '').trim();
     } finally {
-        if (prev.image === undefined) delete message.extra.image; else message.extra.image = prev.image;
-        if (prev.inline === undefined) delete message.extra.inline_image; else message.extra.inline_image = prev.inline;
+        if (prevMedia === undefined) delete message.extra.media; else message.extra.media = prevMedia;
+        URL.revokeObjectURL(blobUrl);
     }
+}
+
+/** Caption all frames; throw if any frame fails so we never send an empty message. */
+async function captionAllFrames(mesId, frames) {
+    const labels = ['start', 'middle', 'end'];
+    const out = [];
+    for (let i = 0; i < frames.length; i++) {
+        toastr.info(`Captioning ${labels[i]} frame (${i + 1}/${frames.length})…`, 'Video Frame Caption');
+        const c = await captionFrame(mesId, frames[i]);
+        if (!c) throw new Error(`No caption returned for the ${labels[i]} frame. Check your Image Captioning source settings.`);
+        out.push(c);
+    }
+    return out;
 }
 
 async function onMessageSent(mesId) {
@@ -135,10 +154,7 @@ async function onMessageSent(mesId) {
         toastr.info('Captioning video frames…', 'Video Frame Caption');
         const frames = await extractFrames(url, s.maxWidth);
 
-        const captions = [];
-        for (const f of frames) captions.push((await captionFrame(mesId, f)) || '(no caption)');
-
-        const [start, middle, end] = captions;
+        const [start, middle, end] = await captionAllFrames(mesId, frames);
         message.extra.video_captions = { start, middle, end };
         message.mes += s.template
             .replace('{start}', start)
@@ -184,9 +200,10 @@ async function onCaptionFileChosen(e) {
     const { s } = getSettings();
     const { chat, name1, addOneMessage, updateMessageBlock, saveChat, executeSlashCommandsWithOptions } = ctx();
     const blobUrl = URL.createObjectURL(file);
+    let createdId = -1;
 
     try {
-        toastr.info('Captioning video frames…', 'Video Frame Caption');
+        toastr.info('Extracting video frames…', 'Video Frame Caption');
         const frames = await extractFrames(blobUrl, s.maxWidth);
 
         // Create the user message first; /caption needs a message to work on.
@@ -200,11 +217,10 @@ async function onCaptionFileChosen(e) {
         };
         chat.push(message);
         const mesId = chat.length - 1;
+        createdId = mesId;
         addOneMessage(message);
 
-        const captions = [];
-        for (const f of frames) captions.push((await captionFrame(mesId, f)) || '(no caption)');
-        const [start, middle, end] = captions;
+        const [start, middle, end] = await captionAllFrames(mesId, frames);
 
         message.extra.video_captions = { start, middle, end };
         message.mes = s.template
@@ -220,6 +236,11 @@ async function onCaptionFileChosen(e) {
     } catch (err) {
         console.error(`[${MODULE}]`, err);
         toastr.error(err.message, 'Video Frame Caption');
+        // Remove the empty placeholder message so nothing blank gets sent.
+        if (createdId >= 0 && chat[createdId] && !chat[createdId].mes) {
+            chat.splice(createdId, 1);
+            $(`#chat .mes[mesid="${createdId}"]`).remove();
+        }
     } finally {
         URL.revokeObjectURL(blobUrl);
     }
